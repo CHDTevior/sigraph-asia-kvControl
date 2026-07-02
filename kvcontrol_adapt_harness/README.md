@@ -25,6 +25,10 @@ KV-on-MaskControl（v16→v18，ep 6000，4×A100 DDP，single-joint pelvis traj
 - M1 (11.75cm) vs M2/M3 (1.1-1.3cm) 的 **10× gap 来自 Stage-2**（last_iter=600 直接优化 continuous embedding，绕过 codebook，是唯一没有 quantization floor 的杠杆）。
 - 反面教材：KV-on-MoMask（failed port）最好只到 ep600 base-only-decode FID 0.581 / KPS 30.6cm——差距全部来自移植违规操作，不是机制本身。
 
+## 给 agent 用的迁移 prompt
+
+新项目里要迁移 KV-Control 时, 直接把 [`AGENT_PROMPT.md`](AGENT_PROMPT.md) 里的 prompt 复制给 agent。
+
 ## 目录结构
 
 ```
