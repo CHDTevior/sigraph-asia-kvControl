@@ -109,14 +109,23 @@ monotonically degrades FID — the direction of both trends matches the mechanis
 
 ### 4.1 Formal latency (A100, same 16 picks, CUDA-synchronized, matched pair)
 
-| keyframes | GN-Maha median | M3 median | speedup |
+| keyframes | GN-Maha median (fast J / row loop) | M3 median | speedup |
 |---|---|---|---|
-| 1 | 0.50 s (± 0.10) | 15.0 s (± 0.35) | **30×** |
-| 5 | 0.60 s (± 0.12) | 18.8 s (± 0.48) | **31×** |
-| dense (per-frame) | 1.70 s (p90 3.4) | 18.2 s (± 0.50) | **11×** |
+| 1 | **0.50 s** / 0.50 s | 15.0 s (± 0.35) | **30×** |
+| 5 | **0.50 s** / 0.60 s | 18.8 s (± 0.48) | **38×** |
+| dense (per-frame) | **0.60 s** (p90 0.7) / 1.70 s | 18.2 s (± 0.50) | **30×** |
 
 (The earlier "~61 s" M3 figure came from a different measurement path; all paper numbers use
 this same-GPU matched-pair table.)
+
+**Fast Jacobian implementation** (`--gn_jac_chunk 64`): the per-row backward loop is replaced
+by a replicated-batch backward (m rows per decode+backward). Adjudicated footnote: "Latency is
+measured using a numerically optimized Jacobian implementation; its Jacobian differs from the
+reference by at most 1.48e-9 elementwise and yields metric-equivalent results under the
+identical five-repeat evaluation protocol" (fast-path 5r: KPS 0.260 ± 0.013, FID 0.0637 ±
+0.0048, Top3 0.7996 ± 0.0064, skate 0.0496 — 0.00–0.20σ from the reference means). Wall-clock:
+2.8× at dense (1.70 → 0.60 s); full-protocol eval drops from ~9 h to ~70 min per repeat.
+Default OFF — published metric numbers are reproduced bit-exact on the row loop.
 
 ### 4.2 Fixed-density stress tests (beyond the standard mixture)
 

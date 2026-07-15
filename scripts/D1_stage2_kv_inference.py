@@ -306,7 +306,11 @@ def _run_protocol(ct2m, vq_model, opt, name, cfg, text, m_length, gj, gjm,
                 "lr": 6e-2,      "iter": cfg["last_iter"],
                 "rgar": cfg.get("rgar"),
                 "s2_optimizer": cfg.get("s2_optimizer"),
-                "gn": cfg.get("gn"),
+                # GN_JAC_CHUNK: opt-in fast replicated-batch Jacobian (metric-equivalent,
+                # not bit-equivalent — leave unset to reproduce published picks exactly)
+                "gn": (dict(cfg["gn"], jac_chunk=int(os.environ["GN_JAC_CHUNK"]))
+                       if cfg.get("gn") is not None and os.environ.get("GN_JAC_CHUNK")
+                       else cfg.get("gn")),
             },
             avoid_points=None,
         )
