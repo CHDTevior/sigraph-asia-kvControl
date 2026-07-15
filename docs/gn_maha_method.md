@@ -1,7 +1,13 @@
-# GN-Maha: Analytic Anchor-Space Control via Codebook-Metric Gauss–Newton
+# GN-Maha: Anchor-Space Control via Codebook-Metric Gauss–Newton
 
-**Status**: validated 2026-07-13 (5-repeat formal eval, test split, MaskControl protocol).
-**Replaces**: the inherited 2,525-iteration two-stage test-time optimization (M3).
+An **analytic-step iterative solver** — a damped Gauss–Newton / Levenberg–Marquardt method whose
+trial updates solve a linearized Mahalanobis least-squares subproblem in closed form. It is *not*
+a one-shot closed-form solver: steps are damped, trial-based, and rollback-guarded.
+
+**Status**: validated 2026-07-13/14 (5-repeat formal eval, test split, MaskControl protocol).
+**Scope**: replaces the inherited 2,525-iteration two-stage test-time optimization (M3) for
+**pelvis-trajectory control at any density** (the regimes tested). Multi-joint control is NOT
+claimed — see §5 for the measured boundary and the full attempted-fix matrix.
 **Training required**: none. Everything below runs on the released frozen checkpoints.
 
 ---
@@ -97,10 +103,31 @@ monotonically degrades FID — the direction of both trends matches the mechanis
 | | M3 (2,525 iters) | **GN-Maha (≤8 solves)** |
 |---|---|---|
 | KPS (5-repeat) | 0.40 ± 0.02 cm | **0.26 ± 0.03 cm** |
-| FID (5-repeat) | 0.065 | **0.062 ± 0.007** |
+| FID (5-repeat) | 0.065 | **0.062 ± 0.007** (comparable point estimates) |
 | Top-3 | 0.799 | **0.799 ± 0.008** |
-| foot-skate | 0.0444 | 0.0497 (+12%, under review) |
-| wall-clock / sample (16 picks, A100) | ~61 s | **1–4 s** |
+| foot-skate | 0.0444 | 0.0497 (+12% — the one residual regression; for context, M3 itself sits at 0.0495 on multi-joint) |
+
+### 4.1 Formal latency (A100, same 16 picks, CUDA-synchronized, matched pair)
+
+| keyframes | GN-Maha median | M3 median | speedup |
+|---|---|---|---|
+| 1 | 0.50 s (± 0.10) | 15.0 s (± 0.35) | **30×** |
+| 5 | 0.60 s (± 0.12) | 18.8 s (± 0.48) | **31×** |
+| dense (per-frame) | 1.70 s (p90 3.4) | 18.2 s (± 0.50) | **11×** |
+
+(The earlier "~61 s" M3 figure came from a different measurement path; all paper numbers use
+this same-GPU matched-pair table.)
+
+### 4.2 Fixed-density stress tests (beyond the standard mixture)
+
+| density | M3 (5r) | GN-Maha (5r) |
+|---|---|---|
+| 49 | KPS 0.80, FID 0.1267 ± 0.0042 | **KPS 0.304 ± 0.015**, FID 0.1293 ± 0.0049 |
+| 196 | KPS 0.70, FID 0.1745 ± 0.0075 | **KPS 0.340**, FID 0.1749 ± 0.0070 |
+
+The FID rise with density is a property of the *regime* (the 2,525-iteration baseline shows the
+same trend on its own: 0.065 → 0.127 → 0.175); GN keeps a 2×+ KPS advantage throughout with
+matching FID.
 
 Skeleton rigidity on the picks *improves* (worst clip 79 → 24 mm bone-length drift).
 Frame-level visual QA (6 clips incl. the worst tail samples): no pose degradation; see
@@ -112,7 +139,52 @@ supported claim — baseline-FID equivalence rests on 5-repeat overlap, not supe
 The solver returns the best observed iterate of its executed prefix; there is no guarantee
 against a longer optimizer run (empirically it wins).
 
-## 5. Code map
+## 5. Multi-joint boundary (measured, honest scoping)
+
+On cross control (up to 6 joints simultaneously, standard protocol) the feed-forward start is
+much worse (40.6 cm vs 29.9 cm single-joint) and the pure analytic solver does not hold.
+M3 baseline (5r): KPS 0.806 ± 0.060, FID 0.0600 ± 0.0090. Attempted-fix matrix (all measured,
+all standard protocol, 1r):
+
+| config | KPS | FID | reading |
+|---|---|---|---|
+| GN-Maha cap48/8 | 2.18 | 0.271 | Jacobian row starvation (p90 residual 7.2 cm) |
+| GN-Maha cap192/16 | 1.02 | 0.288 | rows fixed (p90 0.7 cm) — FID does not recover |
+| + proximal filter β∈{.01,.03,.1} | 1.07–1.32 | 0.266–0.281 | drift *magnitude* is not the cause |
+| GN-**L2** cap192/16 | 0.94 | 0.176 | metric flip! see below |
+| Stage-1(35,dyn,per-sample) + GN | **0.76** | 0.177 | beats M3 on KPS; FID floor persists |
+| **GNbs1: BATCHED Stage-1 + per-sample GN (5r)** | **0.664 ± 0.070** | 0.0751 ± 0.0127 | see verdict below |
+
+### 5.1 GNbs1 — the engineered fix, and its adjudicated verdict
+
+Replacing the per-sample Stage-1 with the baseline's **batched** Stage-1 (killing the batch=1
+logit-overfitting FID tax) and keeping GN as a per-sample finisher recovers almost everything
+(5 repeats): KPS 0.664 ± 0.070 (**17.6% better than M3**), Top3 0.7962 ± 0.0038, ~7 s/sample
+(2.1–2.7× faster than M3). Mean FID was 0.0751 vs 0.0600 for M3 (Δ = +0.0151; +25.2%),
+narrowly exceeding the pre-registered ceiling of 0.0750 by 0.0001. GNbs1 therefore did **not**
+satisfy the composite promotion gate; all five repeats, including the 0.0999 repeat, were
+retained. Matched-repeat pairing shows the FID deficit is consistent (worse in all 5 paired
+repeats), so it is reported as a systematic ~+25% relative FID cost, not noise. Disposition:
+the multi-joint main-table entry remains M3; GNbs1 is reported as the fast secondary
+operating point.
+
+Two mechanism findings worth keeping:
+
+1. **The metric conclusion inverts across control types.** On pelvis control Mahalanobis ≫ L2
+   (FID 0.062 vs 0.137); on multi-joint L2 > Mahalanobis (0.176 vs 0.288). Consistent reading:
+   the codebook covariance's high-variance directions are dominated by global/pelvis motion —
+   exactly what pelvis control needs to move, exactly what multi-joint control must NOT abuse
+   (the solver satisfies limb constraints through global dims → whole-body distortion). A
+   control-subspace-local metric is the natural next step.
+2. **The per-sample Stage-1 penalty.** Batch=1 logit TTT alone raises FID ~0.08 even on
+   pelvis control (s1C probe: 0.141 vs 0.065) — single-sample overfitting, not a GN issue
+   (pure GN per-sample on pelvis: FID 0.062, clean). A batched-Stage-1 + per-sample-GN
+   implementation is the identified engineering path for multi-joint.
+
+Path-validity control: batched vs per-sample feed-forward on cross differ by only +0.010 FID
+(0.066 vs 0.076) — the floor above is real, not a harness artifact.
+
+## 6. Code map
 
 | file | what |
 |---|---|

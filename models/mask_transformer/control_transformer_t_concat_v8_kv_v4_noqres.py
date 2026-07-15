@@ -1036,26 +1036,27 @@ class ControlTransformerTConcatV4(MaskTransformer):
                 #     delta = -J^T (J J^T + lambda I)^{-1} r
                 # (minimum-norm LM step; the linear system is 3A x 3A — trivially small).
                 # Each LM step costs 3A backward passes for the Jacobian rows + 1 decode.
-                # K<=8 steps replace the 600-iteration Adam loop. batch=1 only (per-sample
-                # Jacobians; the batched variant is future work).
-                if len(clip_text) != 1:
-                    raise RuntimeError("STAGE2 GN currently requires batch=1")
+                # K<=8 steps replace the 600-iteration Adam loop. The Jacobian is per-sample,
+                # so batch mode loops samples AFTER the (batched) Stage-1 — this is the
+                # "batched-S1 + per-sample-GN" configuration: Stage-1 keeps its batch
+                # amortization and stays on-distribution (no batch=1 logit overfitting),
+                # GN only performs the small finishing moves it is FID-safe for.
                 _gn_cfg = (control_opt or {}).get("gn", {}) if control_opt else {}
                 _gn_steps = int(_gn_cfg.get("max_steps", 8))
                 _gn_tau = float(_gn_cfg.get("tau", 1e-6))       # target anchor MSE (m^2)
-                _gn_lam = float(_gn_cfg.get("lam0", 1e-2))
+                _gn_lam0 = float(_gn_cfg.get("lam0", 1e-2))
                 _gn_amax = int(_gn_cfg.get("anchor_cap", 48))   # Jacobian row budget
-                b_idx, f_idx_full, j_idx_full = torch.where(global_joint_mask)
-                if not bool((b_idx == 0).all()):     # runtime check — python -O strips asserts
-                    raise RuntimeError("GN batch=1 violated: mask has entries beyond sample 0")
-                # Dense control: the JACOBIAN is capped for cost, but acceptance / stopping /
-                # reporting use the FULL mask — otherwise the solver could fit the 48
-                # collocation rows while degrading the frames between them (codex P1).
-                f_idx, j_idx = f_idx_full, j_idx_full
-                if len(f_idx) > _gn_amax:
-                    sel = torch.linspace(0, len(f_idx) - 1, _gn_amax).round().long()
-                    f_idx, j_idx = f_idx[sel], j_idx[sel]
-                _A = len(f_idx)
+                # prox_beta > 0: proximal acceptance — a trial must reduce anchor MSE
+                # AND the combined C_beta = mse/mse0 + beta * D_Sigma(e, e0), where
+                # D_Sigma is the mean per-dim Mahalanobis distance from the feed-forward
+                # start e0. Controls cumulative off-manifold drift (multi-joint FID fix).
+                _gn_beta = float(_gn_cfg.get("prox_beta", 0.0))
+                # jac_chunk: rows per replicated-batch backward (0 = per-row loop).
+                # DEFAULT 0: the fast path is metric-equivalent but NOT bit-equivalent
+                # (conv backward float reassociation diverges the LM branch path within
+                # solver noise) — published numbers stay reproducible on the row loop;
+                # opt in explicitly for latency-critical runs.
+                _gn_jchunk = int(_gn_cfg.get("jac_chunk", 0))
 
                 # metric="codebook_cov": minimum-MAHALANOBIS-norm steps instead of minimum-L2.
                 # Diagnosis 2026-07-13: plain min-L2 dual steps jump to the constraint surface
@@ -1084,106 +1085,212 @@ class ControlTransformerTConcatV4(MaskTransformer):
                 elif _gn_metric:
                     raise ValueError(f"unknown gn metric {_gn_metric!r}")
 
-                def _gn_apply_sigma(vec):
-                    """Apply the blockwise codebook metric to a flat (P,) vector."""
-                    if _sigma_q is None:
-                        return vec
-                    out, off = [], 0
-                    for qi, e in enumerate(emb_optim_list):
-                        n = e.numel()
-                        blk = vec[off:off + n].view(e.shape)                  # (1, C, Tk)
-                        out.append(torch.einsum("cd,bdt->bct", _sigma_q[qi], blk).reshape(-1))
-                        off += n
-                    return torch.cat(out)
+                _chol_q = None
+                if _gn_beta > 0.0 and _sigma_q is not None:
+                    _chol_q = [torch.linalg.cholesky(S) for S in _sigma_q]
 
-                def _gn_decode():
-                    pm = vq_model.vqvae.forward_decoder_from_quantized_codes(emb_optim_list)
-                    pm = pm.squeeze(2).permute(0, 2, 1) * _std + _mean
-                    return recover_from_ric(pm.float(), self.opt.joints_num)
+                def _gn_solve_one(_emb, _gj, _gjm, _tag):
+                    # Solve ONE sample: _emb = list of six (1, C, Tk) leaf tensors,
+                    # _gj/_gjm = that sample's (1, T, 22[, 3]) control tensors.
+                    _gn_lam = _gn_lam0
+                    b_idx, f_idx_full, j_idx_full = torch.where(_gjm)
+                    if not bool((b_idx == 0).all()):  # runtime check — python -O strips asserts
+                        raise RuntimeError("GN per-sample slice violated: mask beyond sample 0")
+                    # Dense control: the JACOBIAN is capped for cost, but acceptance / stopping /
+                    # reporting use the FULL mask — otherwise the solver could fit the 48
+                    # collocation rows while degrading the frames between them (codex P1).
+                    f_idx, j_idx = f_idx_full, j_idx_full
+                    if len(f_idx) > _gn_amax:
+                        sel = torch.linspace(0, len(f_idx) - 1, _gn_amax).round().long()
+                        f_idx, j_idx = f_idx[sel], j_idx[sel]
+                    _A = len(f_idx)
 
-                def _gn_residual(pj):
-                    # (3A,) SOLVE residual (capped rows), metres
-                    return (pj[0, f_idx, j_idx] - global_joint[0, f_idx, j_idx]).reshape(-1)
+                    def _gn_apply_sigma(vec):
+                        """Apply the blockwise codebook metric to a flat (P,) vector."""
+                        if _sigma_q is None:
+                            return vec
+                        out, off = [], 0
+                        for qi, e in enumerate(_emb):
+                            n = e.numel()
+                            blk = vec[off:off + n].view(e.shape)              # (1, C, Tk)
+                            out.append(torch.einsum("cd,bdt->bct", _sigma_q[qi], blk).reshape(-1))
+                            off += n
+                        return torch.cat(out)
 
-                def _gn_mse_full(pj):
-                    # scalar anchor MSE over the FULL mask — the accept/stop signal
-                    d = pj[0, f_idx_full, j_idx_full] - global_joint[0, f_idx_full, j_idx_full]
-                    return float((d ** 2).mean().item())
+                    _e0 = None
+                    if _gn_beta > 0.0:
+                        _e0 = [e.detach().clone() for e in _emb]
 
-                with torch.enable_grad():
-                    for _gn_it in range(_gn_steps):
-                        pj = _gn_decode()
-                        r = _gn_residual(pj)
-                        mse = _gn_mse_full(pj)
-                        if mse < _gn_tau:
-                            break
-                        # Jacobian rows: one backward per residual component (3A of them),
-                        # flattened over all six embedding tensors.
-                        J_rows = []
-                        for k in range(3 * _A):
-                            grads = torch.autograd.grad(
-                                r[k], emb_optim_list, retain_graph=(k < 3 * _A - 1),
-                                allow_unused=True)
-                            J_rows.append(torch.cat(
-                                [(g if g is not None else torch.zeros_like(e)).reshape(-1)
-                                 for g, e in zip(grads, emb_optim_list)]))
-                        J = torch.stack(J_rows)                          # (3A, P)
-                        with torch.no_grad():
-                            if _sigma_q is not None:
-                                # one einsum per quantizer over ALL rows (codex P2: the
-                                # per-row loop launched up to 864 kernels per LM step)
-                                JS_parts, off = [], 0
-                                for qi, e in enumerate(emb_optim_list):
-                                    n = e.numel()
-                                    blk = J[:, off:off + n].view(J.shape[0], *e.shape[1:])
-                                    JS_parts.append(torch.einsum(
-                                        "cd,mdt->mct", _sigma_q[qi], blk).reshape(J.shape[0], -1))
-                                    off += n
-                                JS = torch.cat(JS_parts, dim=1)          # (3A, P) = J Sigma
-                                JJt = J @ JS.T                            # J Sigma J^T
+                    def _gn_prox_dist():
+                        # mean per-dim Mahalanobis (or L2) distance of e from the start e0
+                        tot, P = 0.0, 0
+                        for qi, (e, e0) in enumerate(zip(_emb, _e0)):
+                            d = (e.detach() - e0).view(e.shape[1], -1)        # (C, Tk)
+                            if _chol_q is not None:
+                                sid = torch.cholesky_solve(d, _chol_q[qi])    # Sigma^-1 d
                             else:
-                                JJt = J @ J.T
-                            _scale = float(JJt.diagonal().mean().item())
-                            if not (_scale > 1e-20):
-                                break     # degenerate Jacobian — LM stalled (codex P1 guard)
-                            eye = torch.eye(JJt.shape[0], device=JJt.device, dtype=JJt.dtype)
-                            # exact-restore base — subtractive undo accumulates float drift
-                            # and later lambda trials would start from a perturbed point
-                            _base = [e.detach().clone() for e in emb_optim_list]
-                            accepted = False
-                            for _try in range(4):                        # trust region on lambda
-                                for e, bb in zip(emb_optim_list, _base):
-                                    e.copy_(bb)
+                                sid = d
+                            tot += float((d * sid).sum().item())
+                            P += d.numel()
+                        return tot / max(P, 1)
+
+                    def _gn_decode():
+                        pm = vq_model.vqvae.forward_decoder_from_quantized_codes(_emb)
+                        pm = pm.squeeze(2).permute(0, 2, 1) * _std + _mean
+                        return recover_from_ric(pm.float(), self.opt.joints_num)
+
+                    def _gn_residual(pj):
+                        # (3A,) SOLVE residual (capped rows), metres
+                        return (pj[0, f_idx, j_idx] - _gj[0, f_idx, j_idx]).reshape(-1)
+
+                    def _gn_mse_full(pj):
+                        # scalar anchor MSE over the FULL mask — the accept/stop signal
+                        d = pj[0, f_idx_full, j_idx_full] - _gj[0, f_idx_full, j_idx_full]
+                        return float((d ** 2).mean().item())
+
+                    _mse0 = None   # anchor MSE at the feed-forward start (C_beta denominator)
+                    _C_prev = None  # last ACCEPTED combined objective
+                    with torch.enable_grad():
+                        for _gn_it in range(_gn_steps):
+                            pj = _gn_decode()
+                            r = _gn_residual(pj)
+                            mse = _gn_mse_full(pj)
+                            if _mse0 is None:
+                                _mse0 = max(mse, 1e-12)
+                                _C_prev = mse / _mse0        # = 1.0, D_Sigma(e0,e0)=0
+                            if mse < _gn_tau:
+                                break
+                            # Jacobian rows. Fast path: REPLICATED-BATCH backward — decode a
+                            # batch of m identical copies of the sample, each replica selects
+                            # its own residual component, one backward returns m rows at once
+                            # through the decoder's native batch parallelism. (A vmap /
+                            # is_grads_batched variant fails here: the decoder backward hits
+                            # as_strided, which has no vmap rule.) The sequential version
+                            # launched 3A tiny backwards and left the GPU at ~40% util.
+                            _nr = 3 * _A
+                            J = None
+                            if _gn_jchunk > 0:
                                 try:
-                                    z = torch.linalg.solve(JJt + _gn_lam * _scale * eye,
-                                                           r.detach())
-                                except Exception:
+                                    _a_all = torch.arange(_nr, device=r.device)
+                                    _chunks = []
+                                    for _i0 in range(0, _nr, _gn_jchunk):
+                                        _rows = _a_all[_i0:_i0 + _gn_jchunk]
+                                        _m = _rows.numel()
+                                        _f_sel = f_idx[_rows // 3]           # (m,) frames
+                                        _j_sel = j_idx[_rows // 3]           # (m,) joints
+                                        _c_sel = _rows % 3                   # (m,) coords
+                                        _erep = [e.detach().repeat(_m, 1, 1)
+                                                  .requires_grad_(True) for e in _emb]
+                                        _pmr = vq_model.vqvae.forward_decoder_from_quantized_codes(_erep)
+                                        _pmr = _pmr.squeeze(2).permute(0, 2, 1) * _std + _mean
+                                        _pjr = recover_from_ric(_pmr.float(), self.opt.joints_num)
+                                        _sc = _pjr[torch.arange(_m, device=r.device),
+                                                   _f_sel, _j_sel, _c_sel].sum()
+                                        _g = torch.autograd.grad(_sc, _erep, allow_unused=True)
+                                        _chunks.append(torch.cat(
+                                            [(gi if gi is not None else torch.zeros(
+                                                (_m,) + tuple(e.shape[1:]),
+                                                device=r.device, dtype=r.dtype))
+                                             .reshape(_m, -1)
+                                             for gi, e in zip(_g, _emb)], dim=1))
+                                    J = torch.cat(_chunks)                   # (3A, P)
+                                except RuntimeError as _je:
+                                    print(f"  [Stage2 GN]{_tag} batched-J unavailable "
+                                          f"({str(_je)[:80]}) — per-row fallback")
+                                    J = None
+                            if J is None:
+                                J_rows = []
+                                for k in range(_nr):
+                                    grads = torch.autograd.grad(
+                                        r[k], _emb, retain_graph=(k < _nr - 1),
+                                        allow_unused=True)
+                                    J_rows.append(torch.cat(
+                                        [(g if g is not None else torch.zeros_like(e)).reshape(-1)
+                                         for g, e in zip(grads, _emb)]))
+                                J = torch.stack(J_rows)                      # (3A, P)
+                            with torch.no_grad():
+                                if _sigma_q is not None:
+                                    # one einsum per quantizer over ALL rows (codex P2: the
+                                    # per-row loop launched up to 864 kernels per LM step)
+                                    JS_parts, off = [], 0
+                                    for qi, e in enumerate(_emb):
+                                        n = e.numel()
+                                        blk = J[:, off:off + n].view(J.shape[0], *e.shape[1:])
+                                        JS_parts.append(torch.einsum(
+                                            "cd,mdt->mct", _sigma_q[qi], blk).reshape(J.shape[0], -1))
+                                        off += n
+                                    JS = torch.cat(JS_parts, dim=1)          # (3A, P) = J Sigma
+                                    JJt = J @ JS.T                            # J Sigma J^T
+                                else:
+                                    JJt = J @ J.T
+                                _scale = float(JJt.diagonal().mean().item())
+                                if not (_scale > 1e-20):
+                                    break     # degenerate Jacobian — LM stalled (codex P1 guard)
+                                eye = torch.eye(JJt.shape[0], device=JJt.device, dtype=JJt.dtype)
+                                # exact-restore base — subtractive undo accumulates float drift
+                                # and later lambda trials would start from a perturbed point
+                                _base = [e.detach().clone() for e in _emb]
+                                accepted = False
+                                for _try in range(4):                        # trust region on lambda
+                                    for e, bb in zip(_emb, _base):
+                                        e.copy_(bb)
+                                    try:
+                                        z = torch.linalg.solve(JJt + _gn_lam * _scale * eye,
+                                                               r.detach())
+                                    except Exception:
+                                        _gn_lam *= 10.0
+                                        continue
+                                    if not torch.isfinite(z).all():
+                                        _gn_lam *= 10.0
+                                        continue
+                                    delta = -_gn_apply_sigma(J.T @ z)        # (P,) [Sigma J^T z]
+                                    off = 0
+                                    for e in _emb:
+                                        n = e.numel()
+                                        e.add_(delta[off:off + n].view_as(e))
+                                        off += n
+                                    pj2 = _gn_decode()
+                                    mse2 = _gn_mse_full(pj2)
+                                    if _gn_beta > 0.0:
+                                        _C2 = mse2 / _mse0 + _gn_beta * _gn_prox_dist()
+                                        _ok = (mse2 < mse) and (_C2 < _C_prev)
+                                    else:
+                                        _ok = mse2 < mse
+                                    if _ok:
+                                        if _gn_beta > 0.0:
+                                            _C_prev = _C2
+                                        _gn_lam = max(_gn_lam * 0.5, 1e-6)
+                                        accepted = True
+                                        break
                                     _gn_lam *= 10.0
-                                    continue
-                                if not torch.isfinite(z).all():
-                                    _gn_lam *= 10.0
-                                    continue
-                                delta = -_gn_apply_sigma(J.T @ z)        # (P,) [Sigma J^T z]
-                                off = 0
-                                for e in emb_optim_list:
-                                    n = e.numel()
-                                    e.add_(delta[off:off + n].view_as(e))
-                                    off += n
-                                pj2 = _gn_decode()
-                                mse2 = _gn_mse_full(pj2)
-                                if mse2 < mse:
-                                    _gn_lam = max(_gn_lam * 0.5, 1e-6)
-                                    accepted = True
-                                    break
-                                _gn_lam *= 10.0
-                            if not accepted:
-                                for e, bb in zip(emb_optim_list, _base):
-                                    e.copy_(bb)                          # exact restore
-                                break                                    # LM stalled — stop
-                        print(f"  [Stage2 GN] step {_gn_it+1}/{_gn_steps} "
-                              f"full-mse {mse:.2e}->{mse2 if accepted else mse:.2e} "
-                              f"lam={_gn_lam:.1e}")
-                emb_list = [e.detach() for e in emb_optim_list]
+                                if not accepted:
+                                    for e, bb in zip(_emb, _base):
+                                        e.copy_(bb)                          # exact restore
+                                    break                                    # LM stalled — stop
+                            print(f"  [Stage2 GN]{_tag} step {_gn_it+1}/{_gn_steps} "
+                                  f"full-mse {mse:.2e}->{mse2 if accepted else mse:.2e} "
+                                  f"lam={_gn_lam:.1e}")
+                    return [e.detach() for e in _emb]
+
+                if _gn_amax <= 0:
+                    raise ValueError(f"gn anchor_cap must be positive, got {_gn_amax}")
+                _emb_out = [e.detach().clone() for e in emb_list]
+                for _bi in range(len(clip_text)):
+                    _gjm_b = global_joint_mask[_bi:_bi + 1]
+                    if not bool(_gjm_b.any()):
+                        continue                     # no anchors — keep feed-forward output
+                    _emb_b = [e[_bi:_bi + 1].clone().detach().contiguous().requires_grad_(True)
+                              for e in emb_list]
+                    _tag = f" s{_bi}" if len(clip_text) > 1 else ""
+                    _sol = _gn_solve_one(_emb_b, global_joint[_bi:_bi + 1], _gjm_b, _tag)
+                    for _qi in range(self.Q):
+                        _emb_out[_qi][_bi:_bi + 1] = _sol[_qi]
+                # codex P0: the common footer below re-derives emb_list from emb_optim_list,
+                # so the solutions MUST be copied back into those leaves (in place) —
+                # assigning emb_list here would be silently discarded.
+                with torch.no_grad():
+                    for _qi in range(self.Q):
+                        emb_optim_list[_qi].data.copy_(_emb_out[_qi])
             elif _opt_choice == "lbfgs":
                 # LBFGS hyper-params chosen for matched-budget comparison: each
                 # outer step runs up to 20 inner LBFGS iters, so 30 outer × 20 inner = 600 total.

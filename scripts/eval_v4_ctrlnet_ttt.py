@@ -85,6 +85,15 @@ def main():
     parser.add_argument("--gn_lam0", type=float, default=1e-2)
     parser.add_argument("--gn_metric", type=str, default="", choices=["", "codebook_cov"])
     parser.add_argument("--gn_ridge", type=float, default=0.1)
+    parser.add_argument("--gn_steps", type=int, default=8)
+    parser.add_argument("--gn_anchor_cap", type=int, default=48)
+    parser.add_argument("--gn_prox_beta", type=float, default=0.0)
+    parser.add_argument("--gn_jac_chunk", type=int, default=0,
+                        help="Jacobian rows per replicated-batch backward (fast, metric-"
+                             "equivalent but not bit-equivalent); 0 = per-row loop")
+    parser.add_argument("--gn_batch", action="store_true",
+                        help="batched Stage-1 + per-sample GN Stage-2 (instead of fully "
+                             "per-sample generation)")
     parser.add_argument("--gn", action="store_true",
                         help="Replace Stage-2 with the Gauss-Newton anchor-dual solve "
                              "(batch=1 generation inside the unchanged metric groups).")
@@ -190,10 +199,13 @@ def main():
         ttt_dynamic=args.ttt_dynamic,
         rgar_cfg=(dict(check_every=10, plateau_rtol=0.01, s2_entry_tau=args.rgar_tau)
                   if args.rgar else None),
-        gn_cfg=(dict(max_steps=8, tau=args.gn_tau, lam0=args.gn_lam0, anchor_cap=48,
+        gn_cfg=(dict(max_steps=args.gn_steps, tau=args.gn_tau, lam0=args.gn_lam0,
+                     anchor_cap=args.gn_anchor_cap, prox_beta=args.gn_prox_beta,
+                     jac_chunk=args.gn_jac_chunk,
                      metric=args.gn_metric, ridge=args.gn_ridge)
                 if args.gn else None),
         seq_gen=args.seq_gen,
+        gn_batch=args.gn_batch,
         ctrl_net=True, each_lr=args.each_lr, each_iter=args.each_iter,
         last_lr=args.last_lr if args.last_lr is not None else args.each_lr,
         last_iter=args.last_iter,

@@ -1158,7 +1158,8 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, c
         # generation runs sample-by-sample and the group is reassembled IN ORDER before the
         # unchanged metric pipeline (codex 019f59cc: keep the 32-sample retrieval groups and
         # negative pools identical; only generation is sequential).
-        elif (getattr(opt, 'gn_cfg', None) is not None or getattr(opt, 'seq_gen', False)) \
+        elif ((getattr(opt, 'gn_cfg', None) is not None and not getattr(opt, 'gn_batch', False))
+                or getattr(opt, 'seq_gen', False)) \
                 and hasattr(ct2m_transformer, 'generate_with_control'):
             ct2m_transformer.ctrl_net = opt.ctrl_net
             _B = len(clip_text)
@@ -1213,6 +1214,11 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, c
                                                                                 'lr': getattr(opt, 'last_lr', 6e-2),
                                                                                 'iter': getattr(opt, 'last_iter', 0),
                                                                                 'rgar': getattr(opt, 'rgar_cfg', None),
+                                                                                # gn_batch: batched Stage-1 + per-sample GN Stage-2
+                                                                                's2_optimizer': ('gn' if (getattr(opt, 'gn_cfg', None) is not None
+                                                                                                 and getattr(opt, 'gn_batch', False)) else None),
+                                                                                'gn': (getattr(opt, 'gn_cfg', None)
+                                                                                       if getattr(opt, 'gn_batch', False) else None),
                                                                             },
                                                                             avoid_points=avoid_points)
         else:
