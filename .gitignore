@@ -1,0 +1,9 @@
+*.pyc
+checkpoints
+editing
+glove
+log
+dataset/HumanML3D
+dataset/KIT-ML
+body_models
+output

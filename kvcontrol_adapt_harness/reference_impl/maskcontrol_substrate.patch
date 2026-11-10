@@ -1,0 +1,222 @@
+diff --git a/exit/utils.py b/exit/utils.py
+index c171597..fab1d48 100644
+--- a/exit/utils.py
++++ b/exit/utils.py
+@@ -7,7 +7,10 @@ import numpy as np
+ import torch
+ from utils.motion_process import recover_from_ric
+ import copy
+-import plotly.graph_objects as go
++try:
++    import plotly.graph_objects as go
++except ImportError:
++    go = None  # plotly not available; visualization functions will fail if called
+ import shutil
+ import datetime
+ import os
+@@ -339,7 +342,8 @@ def copyComplete(source, target):
+     if os.path.isfile(source):
+         shutil.copy2(source, target)
+     else:
+-        shutil.copytree(source, target, ignore=shutil.ignore_patterns('__pycache__'))
++        # KV-on-MaskControl port: dirs_exist_ok=True so --is_continue can re-enter existing source/ dir.
++        shutil.copytree(source, target, ignore=shutil.ignore_patterns('__pycache__'), dirs_exist_ok=True)
+     # copy owner and group
+     st = os.stat(source)
+     os.chown(target, st.st_uid, st.st_gid)
+@@ -353,7 +357,8 @@ def init_save_folder(save_root, copysource=True):
+     import glob
+     global base_dir
+     save_source = f'{save_root}/source/'
+-    os.makedirs(save_source, mode=os.umask(0), exist_ok=False)
++    # KV-on-MaskControl port: exist_ok=True so --is_continue can re-enter existing run dir.
++    os.makedirs(save_source, mode=os.umask(0), exist_ok=True)
+     os.chmod(save_source, 0o777)
+     if copysource:
+         _list = glob.glob('*')
+diff --git a/options/base_option.py b/options/base_option.py
+index 48aa002..9070418 100644
+--- a/options/base_option.py
++++ b/options/base_option.py
+@@ -48,14 +48,19 @@ class BaseOptions():
+             print('%s: %s' % (str(k), str(v)))
+         print('-------------- End ----------------')
+         if self.is_train:
+-            if self.opt.name != 'TEMP':
++            # KV-on-MaskControl port: skip date-prefixing when --is_continue so we resume
++            # into the existing run's dir (else the resume path resolves to a fresh 'z<date>_'
++            # dir and load_state_dict has nowhere to load from).
++            _is_continue = getattr(self.opt, 'is_continue', False)
++            if self.opt.name != 'TEMP' and not _is_continue:
+                 import datetime
+                 date = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+                 self.opt.name = f'z{date}_{self.opt.name}'
+             # save to the disk
+             expr_dir = os.path.join(self.opt.checkpoints_dir, self.opt.dataset_name, self.opt.name)
+-            if not os.path.exists(expr_dir):
+-                os.makedirs(expr_dir)
++            # DDP-safe: exist_ok=True avoids the 4-rank mkdir race that fails
++            # this file at rank>0 with FileExistsError on the shared FS.
++            os.makedirs(expr_dir, exist_ok=True)
+             file_name = os.path.join(expr_dir, 'opt.txt')
+             with open(file_name, 'wt') as opt_file:
+                 opt_file.write('------------ Options -------------\n')
+diff --git a/options/train_option.py b/options/train_option.py
+index da31719..8a50b16 100644
+--- a/options/train_option.py
++++ b/options/train_option.py
+@@ -32,6 +32,20 @@ class TrainT2MOptions(BaseOptions):
+ 
+         self.parser.add_argument('--xent', default=.1, type=float, help="")
+         self.parser.add_argument('--ctrl_loss', default=.9, type=float, help="")
++
++        # ============== KV-Control adapter options (KV-on-MaskControl port) ==============
++        # Default is the original MaskControl ControlNet mechanism. Pass --control_adapter kv
++        # to swap in the v4-paper-style K/V residual injection adapter.
++        self.parser.add_argument('--control_adapter', default='ctrlnet', type=str,
++                                 choices=['ctrlnet', 'kv'],
++                                 help="Control mechanism: 'ctrlnet' (MaskControl default) or 'kv' (paper v4 KV-Control)")
++        self.parser.add_argument('--kv_rank', default=64, type=int,
++                                 help="KV-Control bottleneck rank for per-layer kv_down/kv_up projections (paper default 64)")
++        self.parser.add_argument('--ctrl_attn_bias_init', default=-5.0, type=float,
++                                 help="KV-Control: initial value of per-layer learnable ctrl attention bias (paper default -5.0)")
++        self.parser.add_argument('--no_q_residual', action='store_true',
++                                 help="KV-Control: disable Q-residual on upper-half layers (paper-faithful default = on)")
++
+         self.is_train = True
+ 
+ 
+diff --git a/train_ctrlnet.py b/train_ctrlnet.py
+index 4983e82..93a099d 100644
+--- a/train_ctrlnet.py
++++ b/train_ctrlnet.py
+@@ -158,16 +158,38 @@ class CtrlNetTrainer:
+         self.ct2m_transformer.to(self.device)
+         self.vq_model.to(self.device)
+ 
+-        # temp_vq = self.ct2m_transformer.vq_model
+-        # self.ct2m_transformer.vq_model = None
+-        # self.opt_t2m_transformer = optim.AdamW(list(self.ct2m_transformer.parameters()), 
+-        #                                        betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
+-        # self.ct2m_transformer.vq_model = temp_vq
+-        self.opt_t2m_transformer = optim.AdamW(list(list(self.ct2m_transformer.seqTransEncoder_control.parameters()) + \
+-                                                    list(self.ct2m_transformer.encoder_control.parameters()) + \
+-                                                    list(self.ct2m_transformer.first_zero_linear.parameters()) + \
+-                                                    list(self.ct2m_transformer.mid_zero_linear.parameters()) ), 
+-                                               betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
++        # KV-on-MaskControl port: build adapter-aware optimizer param list.
++        # KV-adapter ckpts do not have seqTransEncoder_control/first_zero_linear/mid_zero_linear
++        # (the original ControlNet branches were delattr'd in KVControlTransformer.__init__);
++        # accessing them here would AttributeError, so branch by adapter.
++        _m = self.ct2m_transformer
++        if hasattr(_m, 'kv_down'):
++            # KV-Control adapter param list
++            kv_params = (
++                list(_m.encoder_control.parameters())
++                + [p for mod in _m.kv_down for p in mod.parameters()]
++                + [p for mod in _m.kv_up_k for p in mod.parameters()]
++                + [p for mod in _m.kv_up_v for p in mod.parameters()]
++                + list(_m.ctrl_attn_bias.parameters())
++            )
++            if getattr(_m, 'use_q_residual', False):
++                kv_params += (
++                    list(_m.q_down.parameters())
++                    + list(_m.q_up.parameters())
++                    + list(_m.q_gates.parameters())
++                )
++            self.opt_t2m_transformer = optim.AdamW(
++                kv_params, betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
++            n_trainable = sum(p.numel() for p in kv_params)
++            print(f'[KV-Control] optimizer: AdamW lr={self.opt.lr} weight_decay=1e-5 '
++                  f'trainable_params={n_trainable/1e6:.3f}M')
++        else:
++            # Legacy MaskControl ControlNet adapter
++            self.opt_t2m_transformer = optim.AdamW(list(list(_m.seqTransEncoder_control.parameters()) +
++                                                        list(_m.encoder_control.parameters()) +
++                                                        list(_m.first_zero_linear.parameters()) +
++                                                        list(_m.mid_zero_linear.parameters())),
++                                                   betas=(0.9, 0.99), lr=self.opt.lr, weight_decay=1e-5)
+         self.scheduler = optim.lr_scheduler.MultiStepLR(self.opt_t2m_transformer,
+                                                         milestones=self.opt.milestones,
+                                                         gamma=self.opt.gamma)
+@@ -267,16 +289,24 @@ class CtrlNetTrainer:
+                 self.save(pjoin(self.opt.model_dir, 'net_best_acc.tar'), epoch, it)
+                 best_acc = np.mean(val_acc)
+             if epoch % 5 == 0:
+-                best_fid, best_div, Rprecision, best_matching, best_skate_ratio, best_mm, traj_err_key, _avoid_dist, _ = \
++                # KV-on-MaskControl port fix: capture the in-loop eval's kps_mean instead of
++                # dropping to `_`. Without this, best_kps_mean stays at the stale pre-loop
++                # value and best_kps.tar saves are driven by the wrong number. codex critical-bug #2.
++                best_fid, best_div, Rprecision, best_matching, best_skate_ratio, best_mm, traj_err_key, _avoid_dist, kps_mean = \
+                 eval_t2m.evaluation_mask_transformer_test_plus_res(eval_val_loader, vq_model, None, ct2m_transformer, None,
+                                                                     i, eval_wrapper=eval_wrapper,
+                                                         time_steps=opt.time_steps, cond_scale=opt.cond_scale,
+                                                         temperature=opt.temperature, topkr=opt.topkr,
+                                                                     force_mask=opt.force_mask, cal_mm=True, f=None, pred_num_batch=16, logger=self.logger, epoch=epoch,
+-                                                                    control=opt.control, 
++                                                                    control=opt.control,
+                                                                     density=-1, opt=opt)
+                 if best_kps_mean > kps_mean:
+                     self.save(pjoin(self.opt.model_dir, 'best_kps.tar'), epoch, it)
++                    # KV-on-MaskControl port: fix MaskControl's stale-tracker bug — without this
++                    # update, every eval after the first overwrites best_kps.tar because
++                    # best_kps_mean stays at the initial float('inf'). codex final-review fix #6.
++                    best_kps_mean = kps_mean
++                    print(f'[best_kps] new best_kps_mean={kps_mean:.4f} at epoch={epoch} iter={it}')
+                 
+ 
+ if __name__ == '__main__':
+@@ -362,8 +392,24 @@ if __name__ == '__main__':
+     wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
+     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+ 
+-    from models.mask_transformer.control_transformer import ControlTransformer
+-    ct2m_transformer = ControlTransformer(code_dim=vq_opt.code_dim,
++    # KV-on-MaskControl port: select control adapter mechanism.
++    # 'ctrlnet' (default) is MaskControl's original deepcopy-transformer + zero-conv branches.
++    # 'kv' swaps to the paper-v4-style per-layer K/V residual injection adapter.
++    _adapter_kwargs = {}
++    if getattr(opt, 'control_adapter', 'ctrlnet') == 'kv':
++        from models.mask_transformer.control_transformer_kv import KVControlTransformer as _CtrlModel
++        _adapter_kwargs = dict(
++            kv_rank=opt.kv_rank,
++            ctrl_attn_bias_init=opt.ctrl_attn_bias_init,
++            use_q_residual=(not opt.no_q_residual),
++        )
++        print(f'[KV-Control] adapter=kv  rank={opt.kv_rank}  bias_init={opt.ctrl_attn_bias_init}  '
++              f'q_residual={(not opt.no_q_residual)}')
++    else:
++        from models.mask_transformer.control_transformer import ControlTransformer as _CtrlModel
++        print('[KV-Control] adapter=ctrlnet (MaskControl default)')
++
++    ct2m_transformer = _CtrlModel(code_dim=vq_opt.code_dim,
+                                         cond_mode='text',
+                                         latent_dim=opt.latent_dim,
+                                         ff_size=opt.ff_size,
+@@ -378,7 +424,8 @@ if __name__ == '__main__':
+                                         std=torch.tensor(eval_val_loader.dataset.std, requires_grad=False).cuda(),
+                                         trans_path=f'./checkpoints/{opt.dataset_name}/{opt.trans_name}/model/latest.tar',
+                                         vq_model=vq_model,
+-                                        control=opt.control)
++                                        control=opt.control,
++                                        **_adapter_kwargs)
+ 
+     # if opt.fix_token_emb:
+     #     ct2m_transformer.load_and_freeze_token_emb(vq_model.quantizer.codebooks[0])
+diff --git a/utils/eval_t2m.py b/utils/eval_t2m.py
+index 429d534..6a86046 100644
+--- a/utils/eval_t2m.py
++++ b/utils/eval_t2m.py
+@@ -1079,7 +1079,11 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, c
+             
+         import timeit
+         start = timeit.default_timer()
+-        if type(ct2m_transformer) is ControlTransformer:
++        # KV-on-MaskControl port: switch `type(x) is ControlTransformer` → `isinstance`
++        # so KV-Control subclasses (KVControlTransformer) also route through the
++        # control path. Strict `type is` was silently sending KV subclass evals to
++        # the base MoMask path, yielding 3 identical eval JSONs at 4-decimals.
++        if isinstance(ct2m_transformer, ControlTransformer):
+             ct2m_transformer.ctrl_net = opt.ctrl_net
+             ct2m_transformer.rt2m_transformer = rt2m_transformer
+             pred_motions_denorm, pred_motions = ct2m_transformer.generate_with_control(clip_text, m_length, time_steps, cond_scale,
